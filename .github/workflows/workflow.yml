@@ -1,0 +1,58 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      make_pypsa: ${{ steps.changes.outputs.make_pypsa }}
+      k8s: ${{ steps.changes.outputs.k8s }}
+    steps:
+    - uses: actions/checkout@v3
+    - uses: dorny/paths-filter@v2
+      id: changes
+      with:
+        filters: |
+          make_pypsa:
+            - 'make-pypsa.sh'
+            - 'pypsa-patches/**'
+          k8s:
+            - 'k8s/**'
+
+  build:
+    needs: changes
+    if: ${{ needs.changes.outputs.make_pypsa == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Push to GCR GitHub Action
+      uses: RafikFarhad/push-to-gcr-github-action@v4.1
+      with:
+        gcloud_service_key: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        registry: europe-central2-docker.pkg.dev
+        project_id: ${{ secrets.GKE_PROJECT }}
+        image_name: pypsa-workflow/pypsa-builder
+        image_tag: ${{ github.sha }},latest
+        dockerfile: Dockerfile
+  update_k8s:
+    needs: changes
+    if: ${{ needs.changes.outputs.k8s == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        credentials_json: '${{ secrets.GCLOUD_SERVICE_KEY }}'
+    
+    - uses: google-github-actions/get-gke-credentials@db150f2cc60d1716e61922b832eae71d2a45938f
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_ZONE }}
+    
+    - name: Deploy
+      run: |-
+        kubectl apply -f k8s -n default

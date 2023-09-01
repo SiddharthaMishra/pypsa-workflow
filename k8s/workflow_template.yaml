@@ -1,0 +1,186 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate  
+metadata:
+  name: pypsa-workflow-template
+spec:
+  # how long to persist information about completed workflows
+  ttlStrategy:
+    secondsAfterCompletion: 1000
+    secondsAfterSuccess: 6000
+    secondsAfterFailure: 50000
+  templates:
+  # the entry point of our workflow, it defines the steps of our whole workflow end-to-end 
+  - name: pypsa-workflow
+    inputs:
+      # we pass these parameters in the workflow which implements this template. The workflow is created in our dashboard api once payment is completed
+      parameters:
+      - name: pypsa_builder_image_tag
+        value: main
+      - name: pypsa_tag
+        value: main
+      - name: pypsa_repo_path
+        value: europe-central2-docker.pkg.dev/crucial-oven-386720/pypsa-workflow/pypsa
+      - name: pypsa_builder_image_path
+        value: europe-central2-docker.pkg.dev/crucial-oven-386720/pypsa-workflow/pypsa-builder:latest
+    steps:
+    # first we build the pypsa-image for the desired tag
+    - - name: build-pypsa-image
+        template: build-pypsa-image
+        arguments:
+          parameters:
+            - name: pypsa_builder_image_path
+              value: "{{ inputs.parameters.pypsa_builder_image_path }}"
+            - name: pypsa_builder_image_tag
+              value: "{{ inputs.parameters.pypsa_builder_image_tag }}"
+            - name: pypsa_tag
+              value: "{{ inputs.parameters.pypsa_tag }}"
+            - name: pypsa_repo_path
+              value: "{{ inputs.parameters.pypsa_repo_path }}"
+    # then we provision a pod to prepare our networks and upload the results to google cloud storage           
+    - - name: prepare-networks
+        template: prepare-networks
+        arguments:
+          parameters:
+          - name: pypsa_image_path
+            value: "{{ steps.build-pypsa-image.outputs.parameters.pypsa_image_path }}"
+    
+    # for each prepared network, we run a pod to solve the network and upload the results
+    - - name: solve-networks
+        template: solve-networks
+        arguments:
+          parameters:
+            - name: prepared_network_opts
+              value: "{{ item }}"
+            - name: pypsa_image_path
+              value: "{{ steps.build-pypsa-image.outputs.parameters.pypsa_image_path }}"
+        withParam: "{{ steps.prepare-networks.outputs.parameters.prepared_network_opts }}"
+
+  # --------------------------------------------#
+
+# this helps us build the latest pypsa image and pushes our custom rules, scripts and packages into the desired pypsa image.
+  - name: build-pypsa-image
+    inputs:
+      parameters:
+      - name: pypsa_builder_image_path
+      - name: pypsa_tag
+      - name: pypsa_repo_path
+    # the image name passed as an output variable so that the rest of the steps know which image to use
+    outputs:
+      parameters:
+      - name: pypsa_image_path
+        valueFrom:
+          path: /tmp/image.txt
+
+    container:
+      # this script is used to create the new image (https://github.com/SiddharthaMishra/pypsa-workflow/blob/main/make-pypsa.sh)
+      image: "{{ inputs.parameters.pypsa_builder_image_path }}"
+      command: ["bash"]
+      args: [ 'make-pypsa.sh' ]
+      env:
+      - name: PYPSA_TAG
+        value: "{{ inputs.parameters.pypsa_tag }}"
+      - name: PYPSA_IMAGE_PATH
+        value: "{{ inputs.parameters.pypsa_repo_path }}"
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+          ephemeral-storage: "2Gi"
+
+  # prepare network doesn't benefit from having multiple VMs, so we provision one big pod to prepare our network
+  - name: prepare-networks
+    inputs:
+      parameters:
+      - name: pypsa_image_path
+    volumes:
+    # pypsa data can exceed what the allowed storage in a k8s pod is, so we temporarily provision an ssd to attach to our pod. This disk is valid for the lifetime of this pod
+    - name: ssd 
+      ephemeral:
+        volumeClaimTemplate:
+          metadata:
+            labels:
+              type: prepare-ssd
+          spec:
+            accessModes: [ "ReadWriteOnce" ]
+            storageClassName: premium-rwo
+            resources:
+              requests:
+                storage: 200Gi
+    # move the pypsa directory to the ssd in our init container
+    initContainers:
+    - image: "{{ inputs.parameters.pypsa_image_path }}"
+      volumeMounts:
+      - mountPath: /tmp
+        name: ssd
+        subPath: tmp
+      command: [ "bash", "-c" ]
+      args: [ 'cd / && mv pypsa-earth/* tmp' ]     
+      name: move-to-ssd
+    # run prepare networks and upload the results
+    container:
+      image: "{{ inputs.parameters.pypsa_image_path }}"
+      command: [ "conda" ]
+      args: [ "run", "--no-capture-output", "-n", "pypsa-earth", "./run.sh"]
+      volumeMounts:
+      - mountPath: /pypsa-earth
+        name: ssd
+        subPath: tmp
+      resources:
+        limits:
+          cpu: "5"
+          memory: "16Gi"
+          ephemeral-storage: "10Gi"
+      env:
+        - name: RUN_FOLDER_PATH
+          value: "{{ workflow.parameters.run_folder_name }}"
+        - name: SUBCOMMAND
+          value: "prepare"
+    # the list of prepared networks is our output, we loop through it to run pods parallely to solve each prepared network 
+    outputs:
+      parameters:
+      - name: prepared_network_opts
+        valueFrom:
+          path: /tmp/all_networks.txt
+
+ 
+  # Take a prepared network as input and solve it
+  - name: solve-networks
+    inputs:
+      parameters:
+      - name: prepared_network_opts
+      - name: pypsa_image_path
+    container:
+      image: "{{ inputs.parameters.pypsa_image_path }}"
+      command: ["bash", "-c"]
+      args: [ 'mkdir -p networks && conda run --no-capture-output -n pypsa-earth ./run.sh' ]
+      resources:
+        limits:
+          cpu: 1
+          memory: 2Gi
+          ephemeral-storage: 10Gi
+      env:
+        - name: PREPARED_NETWORK_OPTS
+          value: "{{inputs.parameters.prepared_network_opts}}"
+        - name: RUN_FOLDER_PATH
+          value: "{{ workflow.parameters.run_folder_name }}"
+        - name: SUBCOMMAND
+          value: "run"
+
+  # the workflow defines this as the onComplete step, ie this step is run regardless of success and failure and it updates the order status
+  - name: update-order-mongo
+    container:
+      image: mongo:latest 
+      command:
+        - mongosh
+      args:
+        - $(MONGO_CONNSTRING)
+        - --eval
+        - 'db.jobs.updateOne({_id: ObjectId("$(TASK_ID)")}, {$set: {"status": "{{ workflow.status }}"}})'
+      env:
+        - name: MONGO_CONNSTRING
+          valueFrom:
+            secretKeyRef:
+              name: creds
+              key: MONGO_CONNSTRING
+        - name: TASK_ID
+          value: "{{workflow.parameters.run_order_id}}" 
